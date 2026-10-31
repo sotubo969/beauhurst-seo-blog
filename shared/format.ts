@@ -8,6 +8,10 @@ export function formatMoney(value: number, currency = '') {
 
 export const formatPercent = (ratio: number) => `${Math.round(ratio * 100)}%`
 
+/** "UK fintech" -> "UK Fintech". Leaves acronyms and already-capitalised words alone. */
+export const titleCase = (text: string) =>
+  text.replace(/\b([a-z])([a-z]*)/g, (_, first: string, rest: string) => first.toUpperCase() + rest)
+
 export function slugify(text: string) {
   return text
     .toLowerCase()

@@ -1,13 +1,42 @@
 <script setup lang="ts">
-useSeoMeta({ title: 'Generate a blog from a CSV', robots: 'noindex, nofollow' })
+import type { ColumnRole, DatasetPreview } from '~~/shared/types'
+import { COLUMN_ROLES } from '~~/shared/types'
+
+useSeoMeta({ title: 'Create a ranking article', robots: 'noindex, nofollow' })
+
+const ROLE_LABELS: Record<ColumnRole, string> = {
+  rank: 'Rank',
+  name: 'Company name',
+  value: 'Ranking value (numeric)',
+  category: 'Category (charted)',
+  tags: 'Tags / sub-sectors',
+  description: 'Description',
+  url: 'Website',
+  other: 'Show in table only',
+  ignore: 'Ignore',
+}
 
 const file = ref<File | null>(null)
+const preview = ref<DatasetPreview | null>(null)
+const roles = ref<Record<string, ColumnRole>>({})
 const industry = ref('')
-const status = ref<'idle' | 'working' | 'error'>('idle')
+const mode = ref<'ai' | 'data'>('ai')
+const status = ref<'idle' | 'previewing' | 'generating'>('idle')
 const error = ref('')
 const dragging = ref(false)
 
-function pick(selected?: File | null) {
+const hasName = computed(() => Object.values(roles.value).includes('name'))
+
+function upload(path: string, extra: Record<string, string> = {}) {
+  const body = new FormData()
+  body.append('file', file.value!)
+  for (const [k, v] of Object.entries(extra)) body.append(k, v)
+  return $fetch(path, { method: 'POST', body })
+}
+
+const message = (e: any) => e?.data?.statusMessage || e?.statusMessage || 'Something went wrong. Please try again.'
+
+async function pick(selected?: File | null) {
   if (!selected) return
   if (!selected.name.toLowerCase().endsWith('.csv')) {
     error.value = 'Please choose a .csv file.'
@@ -15,86 +44,148 @@ function pick(selected?: File | null) {
   }
   error.value = ''
   file.value = selected
-  // Suggest an industry from the file name, e.g. "uk-healthtech-top-100.csv" -> "healthtech"
-  if (!industry.value) {
-    industry.value = selected.name
-      .replace(/\.csv$/i, '')
-      .replace(/\b(top|uk|\d+|companies|data(set)?|list|ranking)\b/gi, '')
-      .replace(/[-_]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
+  preview.value = null
+  industry.value = selected.name
+    .replace(/\.csv$/i, '')
+    .replace(/\b(top|\d+|companies|data(set)?|list|ranking)\b/gi, '')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  status.value = 'previewing'
+  try {
+    preview.value = await upload('/api/preview') as DatasetPreview
+    roles.value = Object.fromEntries(preview.value.columns.map(c => [c.key, c.role]))
+  }
+  catch (e) {
+    error.value = message(e)
+    file.value = null
+  }
+  finally {
+    status.value = 'idle'
   }
 }
 
-function onDrop(e: DragEvent) {
-  dragging.value = false
-  pick(e.dataTransfer?.files[0])
-}
-
-async function submit() {
-  if (!file.value) return
-  status.value = 'working'
+async function generate() {
+  status.value = 'generating'
   error.value = ''
-
-  const body = new FormData()
-  body.append('file', file.value)
-  body.append('industry', industry.value.trim())
-
   try {
-    const { slug } = await $fetch('/api/generate', { method: 'POST', body })
+    const { slug } = await upload('/api/generate', {
+      industry: industry.value.trim(),
+      mode: mode.value,
+      roles: JSON.stringify(roles.value),
+    }) as { slug: string }
     await navigateTo(`/blog/${slug}`)
   }
-  catch (e: any) {
-    status.value = 'error'
-    error.value = e?.data?.statusMessage || e?.statusMessage || 'Something went wrong generating the blog.'
+  catch (e) {
+    error.value = message(e)
+    status.value = 'idle'
   }
+}
+
+function reset() {
+  file.value = null
+  preview.value = null
+  error.value = ''
 }
 </script>
 
 <template>
-  <div class="container page narrow">
-    <h1>Generate a blog from a CSV</h1>
+  <div class="container page narrow-wide">
+    <p class="eyebrow">Content studio</p>
+    <h1>Create a ranking article</h1>
     <p class="lead">
-      Upload a ranked company dataset from any industry. Columns are detected automatically, statistics are
-      calculated from the data, and an LLM writes the SEO copy around them.
+      Upload a company dataset from any sector. Statistics, charts and key findings are calculated from the data;
+      you choose whether a language model polishes the narrative.
     </p>
 
-    <form class="upload-form" @submit.prevent="submit">
-      <label
-        class="dropzone"
-        :class="{ dragging, 'has-file': file }"
-        @dragover.prevent="dragging = true"
-        @dragleave="dragging = false"
-        @drop.prevent="onDrop"
-      >
-        <input type="file" accept=".csv,text/csv" class="visually-hidden" @change="pick(($event.target as HTMLInputElement).files?.[0])">
-        <strong v-if="file">{{ file.name }}</strong>
-        <strong v-else>Drop a CSV here or click to browse</strong>
-        <span class="muted small">{{ file ? `${(file.size / 1024).toFixed(0)} KB` : 'Max 2 MB. Needs a header row and a company name column.' }}</span>
-      </label>
+    <ol class="steps">
+      <li :class="{ done: preview }">
+        <h2><span class="step-number">1</span> Upload dataset</h2>
+        <label
+          class="dropzone"
+          :class="{ dragging, 'has-file': file }"
+          @dragover.prevent="dragging = true"
+          @dragleave="dragging = false"
+          @drop.prevent="dragging = false; pick($event.dataTransfer?.files[0])"
+        >
+          <input type="file" accept=".csv,text/csv" class="visually-hidden" @change="pick(($event.target as HTMLInputElement).files?.[0])">
+          <template v-if="file">
+            <strong>{{ file.name }}</strong>
+            <span class="muted small">
+              {{ status === 'previewing' ? 'Analysing columns…' : `${preview?.rowCount ?? 0} rows · ${(file.size / 1024).toFixed(0)} KB · click to replace` }}
+            </span>
+          </template>
+          <template v-else>
+            <strong>Drop a CSV here or click to browse</strong>
+            <span class="muted small">Up to 2 MB, with a header row and one row per company</span>
+          </template>
+        </label>
+      </li>
 
-      <label class="field">
-        <span>Industry or topic</span>
-        <input v-model="industry" type="text" placeholder="e.g. UK healthtech" maxlength="60">
-        <span class="muted small">Used in the title and keywords. Suggested from the file name.</span>
-      </label>
+      <li v-if="preview" class="done">
+        <h2><span class="step-number">2</span> Check column mapping</h2>
+        <p class="muted small">Detected automatically. Adjust anything that looks wrong.</p>
+        <div class="table-scroll">
+          <table class="mapping-table">
+            <thead>
+              <tr>
+                <th scope="col">Column</th>
+                <th scope="col">Used as</th>
+                <th scope="col">Example values</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="column in preview.columns" :key="column.key">
+                <th scope="row">{{ column.key }}</th>
+                <td>
+                  <select v-model="roles[column.key]" :aria-label="`Role for ${column.key}`">
+                    <option v-for="role in COLUMN_ROLES" :key="role" :value="role">{{ ROLE_LABELS[role] }}</option>
+                  </select>
+                </td>
+                <td class="muted small sample-cell">{{ preview.sample.slice(0, 3).map(r => r[column.key]).filter(Boolean).join(' · ') }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-if="!hasName" class="error">Choose which column holds the company name.</p>
+      </li>
 
-      <button class="button" type="submit" :disabled="!file || status === 'working'">
-        {{ status === 'working' ? 'Generating… this can take up to a minute' : 'Generate blog' }}
-      </button>
+      <li v-if="preview">
+        <h2><span class="step-number">3</span> Article settings</h2>
+        <label class="field">
+          <span>Sector or topic</span>
+          <input v-model="industry" type="text" placeholder="e.g. UK healthtech" maxlength="60">
+          <span class="muted small">Used in the headline, URL and keywords.</span>
+        </label>
 
-      <p v-if="error" class="error" role="alert">{{ error }}</p>
-    </form>
+        <fieldset class="mode-picker">
+          <legend>Narrative</legend>
+          <label :class="{ selected: mode === 'ai' }">
+            <input v-model="mode" type="radio" value="ai">
+            <span>
+              <strong>AI-assisted, fact-checked</strong>
+              <span class="muted small">An LLM writes the prose from the computed findings. Any passage with a figure not found in the data is removed.</span>
+            </span>
+          </label>
+          <label :class="{ selected: mode === 'data' }">
+            <input v-model="mode" type="radio" value="data">
+            <span>
+              <strong>Data-only</strong>
+              <span class="muted small">Rules-based copy generated straight from the statistics. No external services, instant and deterministic.</span>
+            </span>
+          </label>
+        </fieldset>
 
-    <details class="help">
-      <summary>What does the CSV need?</summary>
-      <ul>
-        <li>One row per company, with a name column (e.g. <code>Company</code>).</li>
-        <li>Optional: a rank column. If missing, rows are ranked by the value column.</li>
-        <li>Optional: a numeric value column such as <code>Total Raised</code> or <code>Revenue</code> for statistics.</li>
-        <li>Low-variety columns like <code>Region</code> or <code>Stage</code> become breakdown charts.</li>
-        <li>Semicolon-separated columns like <code>Industries</code> become sub-sector counts.</li>
-      </ul>
-    </details>
+        <div class="actions">
+          <button class="button" type="button" :disabled="!hasName || status !== 'idle'" @click="generate">
+            {{ status === 'generating' ? (mode === 'ai' ? 'Writing and fact-checking…' : 'Generating…') : 'Generate article' }}
+          </button>
+          <button class="button button-ghost" type="button" :disabled="status !== 'idle'" @click="reset">Start again</button>
+        </div>
+      </li>
+    </ol>
+
+    <p v-if="error" class="error" role="alert">{{ error }}</p>
   </div>
 </template>

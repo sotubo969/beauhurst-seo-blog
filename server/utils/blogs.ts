@@ -1,4 +1,5 @@
 import type { Blog, BlogSummary } from '~~/shared/types'
+import { formatMoney } from '~~/shared/format'
 
 // Blogs are saved as JSON through Nitro storage (mounted on ./data/blogs in nuxt.config).
 // New uploads show up straight away because pages read from storage at request time.
@@ -17,15 +18,16 @@ export async function listBlogs(): Promise<BlogSummary[]> {
   const blogs = await Promise.all(keys.map(k => store().getItem(k)))
 
   return blogs
-    .filter((b): b is Blog => !!b)
+    .filter((b): b is Blog => !!b?.copy)
     .map(b => ({
       slug: b.slug,
       industry: b.industry,
       createdAt: b.createdAt,
-      generatedBy: b.generatedBy,
       title: b.copy.title,
       metaDescription: b.copy.metaDescription,
       count: b.stats.count,
+      total: b.stats.valueColumn ? formatMoney(b.stats.total, b.stats.currency) : null,
+      topName: b.stats.top?.name ?? null,
     }))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }

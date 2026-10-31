@@ -1,74 +1,224 @@
-import type { BlogCopy, ColumnInfo, DatasetStats } from '~~/shared/types'
-import { formatMoney, formatPercent } from '~~/shared/format'
-import { columnFor } from './dataset'
+import type { BlogCopy, ColumnInfo, CopyReview, DatasetStats, Insight } from '../../shared/types'
+import { formatMoney, formatPercent, titleCase } from '../../shared/format'
+import { columnFor, parseNumber } from './dataset'
+import { verifyCopy } from './factcheck'
 
-interface CopyInput {
+export type CopyMode = 'ai' | 'data'
+
+export interface CopyInput {
   industry: string
   columns: ColumnInfo[]
   rows: Record<string, string>[]
   stats: DatasetStats
+  insights: Insight[]
 }
 
-/** Plain-language facts derived from the data. Both the LLM prompt and the template use these. */
-export function buildFacts({ industry, columns, rows, stats }: CopyInput) {
-  const money = (n: number) => formatMoney(n, stats.currency)
-  const nameKey = columnFor(columns, 'name')
-  const descKey = columnFor(columns, 'description')
-  const facts: string[] = [`Dataset: top ${stats.count} ${industry} companies.`]
+const list = (items: string[]) =>
+  items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items.at(-1)}` : (items[0] ?? '')
 
+function concentrationLabel(gini: number) {
+  if (gini >= 0.5) return 'highly concentrated'
+  if (gini >= 0.3) return 'moderately concentrated'
+  return 'relatively evenly spread'
+}
+
+/** A closing paragraph that draws the breakdowns together rather than repeating them. */
+function summarise(stats: DatasetStats, Industry: string) {
+  const traits = stats.breakdowns
+    .map((b) => {
+      const lead = [...b.items].sort((x, y) => y.count - x.count)[0]!
+      return lead.share >= 0.6 ? `${formatPercent(lead.share)} share the same ${b.column.toLowerCase()} (${lead.label})` : null
+    })
+    .filter((t): t is string => !!t)
+
+  const parts: string[] = []
   if (stats.valueColumn) {
-    facts.push(
-      `Ranked by "${stats.valueColumn}". Combined total: ${money(stats.total)}.`,
-      `Average: ${money(stats.mean)}. Median: ${money(stats.median)}.`,
-      `Largest: ${stats.top!.name} with ${money(stats.top!.value)}. Smallest in the list: ${stats.bottom!.name} with ${money(stats.bottom!.value)}.`,
-      `The top 10 account for ${money(stats.top10Total)}, or ${formatPercent(stats.top10Share)} of the total.`,
-    )
+    parts.push(`${stats.valueColumn.toLowerCase()} across the top ${Industry} companies is ${concentrationLabel(stats.gini)}`)
+  }
+  if (traits.length) parts.push(`the group is fairly uniform: ${list(traits)}`)
+  if (!parts.length) return null
+
+  const sentence = `Taken together, ${list(parts)}.`
+  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)} For investors, partners and analysts, the ranking offers a quick way to identify the most established names in the sector and where activity is clustered.`
+}
+
+/* ------------------------------------------------------------------ */
+/* Data-led copy: written entirely from the statistics, no LLM needed  */
+/* ------------------------------------------------------------------ */
+
+export function dataCopy({ industry, rows, columns, stats, insights }: CopyInput): BlogCopy {
+  const money = (n: number) => formatMoney(n, stats.currency)
+  const year = new Date().getFullYear()
+  const Industry = titleCase(industry)
+  const metric = stats.valueColumn?.toLowerCase()
+  const nameKey = columnFor(columns, 'name')!
+  const sections: BlogCopy['sections'] = []
+
+  if (metric && stats.top) {
+    const podium = stats.leaders.slice(0, 3).map(l => `${l.name} (${money(l.value)})`)
+    sections.push({
+      heading: `The top ${Industry} companies by ${metric}`,
+      paragraphs: [
+        `${list(podium)} make up the top three. Together the ten highest-ranked companies account for ${money(stats.top10Total)}, or ${formatPercent(stats.top10Share)} of the ${money(stats.total)} recorded across the full list.`,
+        `Reaching the ranking is itself a marker of scale: the company in last place has ${money(stats.bottom!.value)} in ${metric}.`,
+      ],
+    })
+
+    const commonBand = [...stats.distribution].sort((a, b) => b.count - a.count)[0]
+    sections.push({
+      heading: `How ${metric} is distributed across ${Industry}`,
+      paragraphs: [
+        `The median company has ${money(stats.median)} in ${metric}, while the average is ${money(stats.mean)}. `
+          + (stats.mean > stats.median * 1.2
+            ? 'Because the average sits well above the median, a small group of large companies is lifting the overall figures.'
+            : 'With the two figures close together, most companies sit near the middle of the range.'),
+        ...(commonBand
+          ? [`The most common band is ${commonBand.label}, which covers ${commonBand.count} companies. Overall, ${metric} is ${concentrationLabel(stats.gini)} (Gini coefficient ${stats.gini.toFixed(2)}).`]
+          : []),
+      ],
+    })
   }
 
-  for (const b of stats.breakdowns) {
-    const leaders = [...b.items].sort((x, y) => y.count - x.count).slice(0, 4)
-    facts.push(`By ${b.column}: ${leaders.map(i => `${i.label} ${i.count} (${formatPercent(i.share)})`).join(', ')}.`)
+  for (const breakdown of stats.breakdowns) {
+    const column = breakdown.column.toLowerCase()
+    const byCount = [...breakdown.items].sort((a, b) => b.count - a.count)
+    const [first, second] = byCount
+
+    const paragraphs = first!.share === 1
+      ? [`Every company in the ranking shares the same ${column}: ${first!.label}. That makes this list a like-for-like comparison of ${Industry} companies at the same point.`]
+      : [
+          `The largest group by ${column} is ${first!.label}, with ${first!.count} companies (${formatPercent(first!.share)})`
+            + (second ? `, followed by ${second.label} with ${second.count}.` : '.')
+            + (metric ? ` Together this group accounts for ${formatPercent(first!.valueShare)} of the combined ${metric}, led by ${first!.leader}.` : ''),
+        ]
+
+    sections.push({ heading: `${Industry} companies by ${column}`, paragraphs })
   }
 
   if (stats.tags?.items.length) {
-    facts.push(`Most common ${stats.tags.column}: ${stats.tags.items.slice(0, 6).map(t => `${t.label} (${t.count})`).join(', ')}.`)
+    const top = stats.tags.items.slice(0, 4)
+    sections.push({
+      heading: `The most common ${Industry} sub-sectors`,
+      paragraphs: [
+        `Companies can sit in more than one sub-sector. The most frequent are ${list(top.map(t => `${t.label} (${t.count})`))}.`,
+      ],
+    })
   }
 
-  const leaders = rows.slice(0, 10).map((row, i) => {
-    const value = stats.valueColumn ? ` – ${row[stats.valueColumn]}` : ''
-    const desc = descKey && row[descKey] ? `: ${row[descKey]}` : ''
-    return `${i + 1}. ${nameKey ? row[nameKey] : 'Unnamed'}${value}${desc}`
-  })
+  const summary = summarise(stats, Industry)
+  if (summary) sections.push({ heading: `What the data tells us about ${Industry}`, paragraphs: [summary] })
 
-  return { facts, leaders }
+  const faq: BlogCopy['faq'] = [
+    {
+      question: `What is the top ${Industry} company?`,
+      answer: metric && stats.top
+        ? `${stats.top.name} ranks first with ${money(stats.top.value)} in ${metric}.`
+        : `${rows[0]?.[nameKey]} ranks first in this list.`,
+    },
+  ]
+  if (metric) {
+    faq.push({
+      question: `How much do the top ${stats.count} ${Industry} companies account for in total?`,
+      answer: `Together they account for ${money(stats.total)} in ${metric}, an average of ${money(stats.mean)} and a median of ${money(stats.median)} per company.`,
+    })
+  }
+  const location = stats.breakdowns.find(b => /(region|city|location|country|county|area)/i.test(b.column))
+  if (location) {
+    const lead = [...location.items].sort((a, b) => b.count - a.count)[0]!
+    faq.push({
+      question: `Where are most ${Industry} companies based?`,
+      answer: `${lead.label} is home to ${lead.count} of the ${stats.count} companies in the ranking (${formatPercent(lead.share)}).`,
+    })
+  }
+
+  return {
+    title: `Top ${stats.count} ${Industry} Companies in ${year}`,
+    metaDescription: (metric && stats.top
+      ? `The top ${stats.count} ${Industry} companies ranked by ${metric}, led by ${stats.top.name}. Full ranking, key statistics and insights for ${year}.`
+      : `The top ${stats.count} ${Industry} companies in ${year}: full ranking table, key statistics and insights.`).slice(0, 160),
+    intro: [
+      `This ranking lists the top ${stats.count} ${Industry} companies${metric ? ` by ${metric}` : ''}. Every figure on this page is calculated directly from the underlying dataset.`,
+      `Below you will find the headline numbers, how the companies break down${stats.breakdowns.length ? ` by ${list(stats.breakdowns.map(b => b.column.toLowerCase()))}` : ''}, and the full ranking table.`,
+    ],
+    sections,
+    faq,
+    keywords: [...new Set([`${industry} companies`, `top ${industry} companies`, `${industry} companies ${year}`, `${industry} ranking`].map(k => k.toLowerCase()))],
+  }
 }
 
-function buildPrompt(input: CopyInput) {
-  const { facts, leaders } = buildFacts(input)
+/* ------------------------------------------------------------------ */
+/* AI-assisted copy: the LLM writes prose around pre-computed findings */
+/* ------------------------------------------------------------------ */
+
+export function buildPrompt(input: CopyInput) {
+  const { stats, insights, industry, rows, columns } = input
+  const money = (n: number) => formatMoney(n, stats.currency)
+  const nameKey = columnFor(columns, 'name')!
+  const descKey = columnFor(columns, 'description')
   const year = new Date().getFullYear()
 
-  return `You are an SEO copywriter for Beauhurst, a UK platform for data on private companies.
-Write a blog post about the dataset below. Use UK English. Only use numbers and company names
-given here: do not invent figures, dates or claims. Do not repeat the full ranking (a table is shown separately).
+  const facts = [
+    `Companies in the list: ${stats.count}`,
+    ...(stats.valueColumn
+      ? [
+          `Ranked by: ${stats.valueColumn}`,
+          `Total: ${money(stats.total)} | Average: ${money(stats.mean)} | Median: ${money(stats.median)}`,
+          `Top 10 combined: ${money(stats.top10Total)} (${formatPercent(stats.top10Share)} of total)`,
+        ]
+      : []),
+    ...stats.breakdowns.map(b => `By ${b.column}: ${[...b.items].sort((x, y) => y.count - x.count).slice(0, 4).map(i => `${i.label} ${i.count}`).join(', ')}`),
+    ...(stats.tags ? [`Top sub-sectors: ${stats.tags.items.slice(0, 5).map(t => `${t.label} ${t.count}`).join(', ')}`] : []),
+  ]
+
+  const leaders = rows.slice(0, 10).map((row, i) =>
+    `${i + 1}. ${row[nameKey]}${stats.valueColumn ? ` (${money(parseNumber(row[stats.valueColumn]) ?? 0)})` : ''}${descKey && row[descKey] ? `: ${row[descKey]}` : ''}`)
+
+  return `You are an editor at a UK business-intelligence publisher writing an SEO article about ${industry}.
+The analysis is already done. Your job is to turn it into clear, professional prose in UK English.
+
+STRICT RULES
+- Only use figures that appear below, written the same way. Never calculate new numbers, estimate, or add dates.
+- Do not invent facts about companies beyond their descriptions.
+- No hype words ("revolutionary", "game-changing"), no exclamation marks.
+- Do not list the full ranking; a table is shown separately.
 
 FACTS
 ${facts.join('\n')}
 
+KEY FINDINGS (already verified)
+${insights.map(i => `- ${i.text}`).join('\n')}
+
 TOP 10
 ${leaders.join('\n')}
 
-Return JSON only, with exactly this shape:
+Return only JSON in this shape:
 {
-  "title": "H1 under 65 characters including the main keyword, e.g. 'Top ${input.stats.count} ${input.industry} Companies in ${year}'",
-  "metaDescription": "140-155 characters, includes the main keyword and a reason to click",
-  "intro": ["2 short paragraphs introducing the list and why it matters"],
-  "sections": [{ "heading": "H2 with a relevant keyword", "paragraphs": ["1-3 paragraphs"] }],
-  "faq": [{ "question": "a question people search for", "answer": "1-2 sentence answer from the facts" }],
-  "keywords": ["5-8 search keywords"]
+  "title": "H1, max 65 characters, main keyword first, e.g. 'Top ${stats.count} ${titleCase(industry)} Companies in ${year}'",
+  "metaDescription": "140-155 characters with the main keyword and a clear reason to click",
+  "intro": ["two short paragraphs"],
+  "sections": [{ "heading": "descriptive H2 containing a keyword", "paragraphs": ["1-3 paragraphs"] }],
+  "faq": [{ "question": "a question people search for", "answer": "1-2 sentences" }],
+  "keywords": ["5-8 search phrases"]
 }
-Write 4 or 5 sections covering: the leaders, concentration of value, the breakdowns
-(location, stage, size or sector, whichever the facts include), and what it means for the
-sector. Write 3 or 4 FAQ items.`
+Write 4-5 sections (the leaders, concentration, the breakdowns, notable companies from the top 10, outlook based only on the findings) and 3-4 FAQs.`
+}
+
+/** Every number a reader could legitimately see, used to fact-check the LLM output. */
+export function knownNumbers({ rows, stats }: CopyInput) {
+  const numbers: number[] = [stats.count, stats.total, stats.mean, stats.median, stats.top10Total, stats.top10Share * 100, stats.gini, 3, 10]
+  for (const row of rows) {
+    for (const v of Object.values(row)) {
+      const n = parseNumber(v)
+      if (n !== null) numbers.push(n)
+    }
+  }
+  for (const group of [...stats.breakdowns.flatMap(b => b.items), ...(stats.tags?.items ?? [])]) {
+    numbers.push(group.count, group.share * 100, group.valueShare * 100, group.value, group.average)
+  }
+  stats.distribution.forEach(d => numbers.push(d.count))
+  if (stats.top && stats.bottom?.value) numbers.push(stats.top.value / stats.bottom.value)
+  if (stats.count > 10) numbers.push(stats.top10Share / (10 / stats.count))
+  return numbers
 }
 
 async function callGemini(prompt: string, apiKey: string, model: string) {
@@ -77,7 +227,7 @@ async function callGemini(prompt: string, apiKey: string, model: string) {
     headers: { 'x-goog-api-key': apiKey },
     body: {
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.6 },
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.4 },
     },
     timeout: 60_000,
   })
@@ -87,97 +237,45 @@ async function callGemini(prompt: string, apiKey: string, model: string) {
 async function callOllama(prompt: string, host: string, model: string) {
   const res = await $fetch<{ response: string }>(`${host.replace(/\/$/, '')}/api/generate`, {
     method: 'POST',
-    body: { model, prompt, format: 'json', stream: false },
+    body: { model, prompt, format: 'json', stream: false, options: { temperature: 0.4 } },
     timeout: 180_000,
   })
   return res.response
 }
 
-/** Copy written without an LLM, so the workflow still works offline or when the free quota runs out. */
-export function templateCopy(input: CopyInput): BlogCopy {
-  const { industry, stats } = input
-  const money = (n: number) => formatMoney(n, stats.currency)
-  const year = new Date().getFullYear()
-  const metric = stats.valueColumn?.toLowerCase() ?? 'size'
-  const sections: BlogCopy['sections'] = []
-
-  if (stats.top) {
-    sections.push({
-      heading: `The leading ${industry} companies`,
-      paragraphs: [
-        `${stats.top.name} tops the ranking with ${money(stats.top.value)} in ${metric}. Across all ${stats.count} companies the combined figure is ${money(stats.total)}, an average of ${money(stats.mean)} each and a median of ${money(stats.median)}.`,
-      ],
-    })
-    sections.push({
-      heading: `How concentrated is ${metric} across the ${industry} ranking?`,
-      paragraphs: [
-        `The ten highest-ranked companies account for ${money(stats.top10Total)}, or ${formatPercent(stats.top10Share)} of the total. ${stats.mean > stats.median * 1.2 ? 'The average sits well above the median, which shows that a few large companies pull the figures up.' : 'The average and median are close, so value is spread fairly evenly across the list.'}`,
-      ],
-    })
-  }
-
-  for (const b of stats.breakdowns) {
-    const lead = [...b.items].sort((x, y) => y.count - x.count)[0]!
-    sections.push({
-      heading: `${industry} companies by ${b.column.toLowerCase()}`,
-      paragraphs: [`${lead.label} is the most common ${b.column.toLowerCase()}, with ${lead.count} of the ${stats.count} companies (${formatPercent(lead.share)}).`],
-    })
-  }
-
-  if (stats.tags?.items.length) {
-    const [first, second] = stats.tags.items
-    sections.push({
-      heading: `Popular ${industry} sub-sectors`,
-      paragraphs: [`${first!.label} is the most common classification, appearing for ${first!.count} companies${second ? `, followed by ${second.label} (${second.count})` : ''}.`],
-    })
-  }
-
-  return {
-    title: `Top ${stats.count} ${industry} Companies in ${year}`,
-    metaDescription: `Discover the top ${stats.count} ${industry} companies in ${year}${stats.top ? `, led by ${stats.top.name}` : ''}. Full ranking table, key statistics and insights.`.slice(0, 158),
-    intro: [
-      `This is our ranking of the top ${stats.count} ${industry} companies${stats.valueColumn ? `, ordered by ${metric}` : ''}. Use it to find the businesses leading the sector and to see where activity is concentrated.`,
-    ],
-    sections,
-    faq: stats.top
-      ? [
-          { question: `What is the largest ${industry} company in the list?`, answer: `${stats.top.name} ranks first with ${money(stats.top.value)} in ${metric}.` },
-          { question: `How much have the top ${stats.count} ${industry} companies raised in total?`, answer: `Together they account for ${money(stats.total)}, with a median of ${money(stats.median)} per company.` },
-        ]
-      : [],
-    keywords: [`${industry} companies`, `top ${industry} companies`, `${industry} ranking ${year}`],
-  }
-}
-
 const isText = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0
-const textList = (v: unknown) => (Array.isArray(v) ? v.filter(isText) : [])
+const textList = (v: unknown) => (Array.isArray(v) ? v.filter(isText).map(s => s.trim()) : [])
 
-/** Keeps whatever the model got right and fills any gaps from the template. */
-function mergeCopy(raw: any, fallback: BlogCopy): BlogCopy {
+/** Normalises whatever the model returned into BlogCopy, filling gaps from the data-led copy. */
+export function mergeCopy(raw: any, fallback: BlogCopy): BlogCopy {
   const sections = Array.isArray(raw?.sections)
     ? raw.sections
         .filter((s: any) => isText(s?.heading))
-        .map((s: any) => ({ heading: s.heading, paragraphs: textList(s.paragraphs) }))
+        .map((s: any) => ({ heading: s.heading.trim(), paragraphs: textList(s.paragraphs) }))
         .filter((s: BlogCopy['sections'][number]) => s.paragraphs.length)
     : []
   const faq = Array.isArray(raw?.faq) ? raw.faq.filter((f: any) => isText(f?.question) && isText(f?.answer)) : []
 
   return {
-    title: isText(raw?.title) ? raw.title : fallback.title,
-    metaDescription: isText(raw?.metaDescription) ? raw.metaDescription.slice(0, 160) : fallback.metaDescription,
+    title: isText(raw?.title) && raw.title.length <= 80 ? raw.title.trim() : fallback.title,
+    metaDescription: isText(raw?.metaDescription) ? raw.metaDescription.trim().slice(0, 160) : fallback.metaDescription,
     intro: textList(raw?.intro).length ? textList(raw.intro) : fallback.intro,
     sections: sections.length ? sections : fallback.sections,
     faq: faq.length ? faq : fallback.faq,
-    keywords: textList(raw?.keywords).length ? textList(raw.keywords) : fallback.keywords,
+    keywords: textList(raw?.keywords).length ? textList(raw.keywords).slice(0, 10) : fallback.keywords,
   }
 }
 
-export async function writeCopy(input: CopyInput): Promise<{ copy: BlogCopy, generatedBy: string }> {
-  const config = useRuntimeConfig()
-  const fallback = templateCopy(input)
-  const prompt = buildPrompt(input)
+export async function writeCopy(input: CopyInput, mode: CopyMode): Promise<{ copy: BlogCopy, review: CopyReview }> {
+  const fallback = dataCopy(input)
+  if (mode === 'data') {
+    return { copy: fallback, review: { mode: 'data', provider: 'none', checkedClaims: 0, rejected: [] } }
+  }
 
+  const config = useRuntimeConfig()
+  const prompt = buildPrompt(input)
   const providers: [string, () => Promise<string>][] = []
+
   // Several Gemini models can be listed, so a lighter model takes over when the free quota on the first runs out
   if (config.geminiApiKey) {
     for (const model of String(config.geminiModel).split(',').map(m => m.trim()).filter(Boolean)) {
@@ -189,13 +287,24 @@ export async function writeCopy(input: CopyInput): Promise<{ copy: BlogCopy, gen
   for (const [name, call] of providers) {
     try {
       const text = await call()
-      const json = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''))
-      return { copy: mergeCopy(json, fallback), generatedBy: name }
+      const merged = mergeCopy(JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '')), fallback)
+      const result = verifyCopy(merged, knownNumbers(input), new Date().getFullYear())
+
+      const copy: BlogCopy = {
+        ...result.copy,
+        title: result.titleOk ? result.copy.title : fallback.title,
+        metaDescription: result.metaOk ? result.copy.metaDescription : fallback.metaDescription,
+        intro: result.copy.intro.length ? result.copy.intro : fallback.intro,
+        sections: result.copy.sections.length >= 2 ? result.copy.sections : fallback.sections,
+        faq: result.copy.faq.length ? result.copy.faq : fallback.faq,
+      }
+      return { copy, review: { mode: 'ai', provider: name, checkedClaims: result.checked, rejected: result.rejected } }
     }
     catch (error) {
       console.warn(`[copywriter] ${name} failed, trying next option:`, (error as Error).message)
     }
   }
 
-  return { copy: fallback, generatedBy: 'template' }
+  // No provider configured or all failed: publish the data-led copy rather than nothing
+  return { copy: fallback, review: { mode: 'data', provider: providers.length ? 'fallback' : 'none', checkedClaims: 0, rejected: [] } }
 }
